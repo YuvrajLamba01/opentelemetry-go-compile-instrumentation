@@ -5,6 +5,7 @@ package instrument
 
 import (
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 
@@ -84,13 +85,91 @@ func (ip *instrumentPhase) match(allSet []*rule.InstRuleSet, args []string) *rul
 			compiled[abs] = true
 		}
 	}
+	var matches []*rule.InstRuleSet
 	for _, rset := range allSet {
 		if rset.ModulePath == importPath && rset.IsTest == isTest && ip.compilesRuleFiles(rset, compiled) {
 			ip.Debug("Match rule set", "set", rset)
-			return rset
+			matches = append(matches, rset)
 		}
 	}
-	return nil
+	if len(matches) == 0 {
+		return nil
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return mergeRuleSets(matches)
+}
+
+type fileRuleKey struct {
+	name         string
+	file         string
+	path         string
+	resolvedPath string
+}
+
+func appendRuleMap[T any](dst, src map[string][]T) {
+	for file, rules := range src {
+		dst[file] = append(dst[file], rules...)
+	}
+}
+
+func appendUniqueFileRules(
+	dst []*rule.InstFileRule,
+	seen map[fileRuleKey]bool,
+	src []*rule.InstFileRule,
+) []*rule.InstFileRule {
+	for _, fr := range src {
+		if fr == nil {
+			continue
+		}
+		key := fileRuleKey{
+			name:         fr.Name,
+			file:         fr.File,
+			path:         fr.Path,
+			resolvedPath: fr.ResolvedPath,
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		dst = append(dst, fr)
+	}
+	return dst
+}
+
+func appendUniqueStrings(dst []string, seen map[string]bool, src []string) []string {
+	for _, s := range src {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		dst = append(dst, s)
+	}
+	return dst
+}
+
+func mergeRuleSets(matches []*rule.InstRuleSet) *rule.InstRuleSet {
+	merged := rule.NewInstRuleSet(matches[0].ModulePath)
+	merged.IsTest = matches[0].IsTest
+	seenFileRules := make(map[fileRuleKey]bool)
+	seenIgnored := make(map[string]bool)
+	for _, rset := range matches {
+		if merged.PackageName == "" && rset.PackageName != "" {
+			merged.PackageName = rset.PackageName
+		}
+		maps.Copy(merged.CgoFileMap, rset.CgoFileMap)
+		appendRuleMap(merged.RawRules, rset.RawRules)
+		appendRuleMap(merged.FuncRules, rset.FuncRules)
+		appendRuleMap(merged.StructRules, rset.StructRules)
+		appendRuleMap(merged.CallRules, rset.CallRules)
+		appendRuleMap(merged.LitRules, rset.LitRules)
+		appendRuleMap(merged.DirectiveRules, rset.DirectiveRules)
+		appendRuleMap(merged.DeclRules, rset.DeclRules)
+		merged.FileRules = appendUniqueFileRules(merged.FileRules, seenFileRules, rset.FileRules)
+		merged.IgnoredCallFiles = appendUniqueStrings(merged.IgnoredCallFiles, seenIgnored, rset.IgnoredCallFiles)
+	}
+	return merged
 }
 
 // compilesRuleFiles reports whether every file rset has rules for is in

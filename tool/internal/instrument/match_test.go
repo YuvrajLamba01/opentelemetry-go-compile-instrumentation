@@ -170,3 +170,61 @@ func TestLoadImportNames_ReadErrorOtherThanMissing(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to read file")
 }
+
+func TestMatchCombinesMultipleMatchingSets(t *testing.T) {
+	runtimeDir := t.TempDir()
+	runtime2File := filepath.Join(runtimeDir, "runtime2.go")
+	procFile := filepath.Join(runtimeDir, "proc.go")
+	args := []string{"compile", "-o", "_pkg_.a", "-p", "runtime", "-buildid", "x", runtime2File, procFile}
+	ip := &instrumentPhase{logger: slog.Default(), workDir: runtimeDir}
+
+	externalSet := rule.NewInstRuleSet("runtime")
+	externalSet.AddStructRule(runtime2File, &rule.InstStructRule{
+		InstBaseRule: rule.InstBaseRule{Name: "external_runtime_field"},
+		Struct:       "g",
+		NewField:     []*rule.InstStructField{{Name: "__repro_field", Type: "any"}},
+	})
+	sharedFileRule := &rule.InstFileRule{
+		InstBaseRule: rule.InstBaseRule{Name: "ext_helper"},
+		File:         "ext.go",
+		Path:         "example.com/hooks",
+		ResolvedPath: t.TempDir(),
+	}
+	externalSet.AddFileRule(sharedFileRule)
+	externalSet.AddIgnoredCallFile(runtime2File)
+
+	glsSet := rule.NewInstRuleSet("runtime")
+	glsSet.PackageName = "runtime"
+	glsSet.AddStructRule(runtime2File, &rule.InstStructRule{
+		InstBaseRule: rule.InstBaseRule{Name: "add_gls_field"},
+		Struct:       "g",
+		NewField:     []*rule.InstStructField{{Name: "otel_ignored_call_count", Type: "int"}},
+	})
+	glsSet.AddRawRule(procFile, &rule.InstRawRule{
+		InstBaseRule: rule.InstBaseRule{Name: "goroutine_propagate"},
+		Func:         "newproc1",
+		Raw:          "_ = 1",
+	})
+	glsFileRule := &rule.InstFileRule{
+		InstBaseRule: rule.InstBaseRule{Name: "gls_linker"},
+		File:         "runtime_gls.go",
+		Path:         util.InternalPath,
+	}
+	glsSet.AddFileRule(glsFileRule)
+	glsSet.AddFileRule(sharedFileRule)
+	glsSet.AddIgnoredCallFile(runtime2File)
+
+	combined := ip.match([]*rule.InstRuleSet{externalSet, glsSet}, args)
+	require.NotNil(t, combined)
+	assert.Equal(t, "runtime", combined.ModulePath)
+	assert.Equal(t, "runtime", combined.PackageName)
+	assert.Len(t, combined.StructRules[runtime2File], 2)
+	assert.Len(t, combined.RawRules[procFile], 1)
+	assert.Equal(t, []*rule.InstFileRule{sharedFileRule, glsFileRule}, combined.FileRules)
+	assert.Equal(t, []string{runtime2File}, combined.IgnoredCallFiles)
+
+	// Input sets must not be mutated when merging.
+	assert.Len(t, externalSet.StructRules[runtime2File], 1)
+	assert.Empty(t, externalSet.RawRules)
+	assert.Len(t, glsSet.StructRules[runtime2File], 1)
+}
